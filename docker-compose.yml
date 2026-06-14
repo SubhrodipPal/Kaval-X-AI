@@ -1,0 +1,355 @@
+# ============================================================
+# Kavalx Advanced Fraud Detection & Banking Security
+# Docker Compose – Full Development Stack
+# ============================================================
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f api-gateway
+# ============================================================
+
+name: kavalx
+
+services:
+  # ── Infrastructure: Databases & Messaging ────────────────
+
+  postgres:
+    image: postgres:16
+    container_name: kavalx-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kavalx
+      POSTGRES_PASSWORD: kavalx
+      POSTGRES_DB: kavalx
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./schema/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kavalx -d kavalx"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  memgraph:
+    image: memgraph/memgraph-platform:latest
+    container_name: kavalx-memgraph
+    restart: unless-stopped
+    ports:
+      - "7687:7687"
+      - "3000:3000"
+    volumes:
+      - mg_data:/var/lib/memgraph
+      - ./schema/memgraph/init.cypher:/etc/memgraph/init.cypher:ro
+    entrypoint:
+      - "/usr/bin/supervisord"
+    healthcheck:
+      test: ["CMD", "echo", "RETURN 1;", "|", "mgconsole"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: kavalx-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --maxmemory 2gb
+        --maxmemory-policy allkeys-lru
+        --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: kavalx-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zk_data:/var/lib/zookeeper/data
+      - zk_log:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kavalx-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 12
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.11
+    container_name: kavalx-etcd
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >
+      etcd
+        --advertise-client-urls=http://127.0.0.1:2379
+        --listen-client-urls=http://0.0.0.0:2379
+        --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+
+  minio:
+    image: minio/minio:latest
+    container_name: kavalx-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  milvus:
+    image: milvusdb/milvus:v2.4-latest
+    container_name: kavalx-milvus
+    restart: unless-stopped
+    depends_on:
+      - etcd
+      - minio
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    command: ["milvus", "run", "standalone"]
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ── Application Services ─────────────────────────────────
+
+  api-gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    container_name: kavalx-api-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  txn-intelligence:
+    build:
+      context: ./services/transaction_intelligence
+      dockerfile: Dockerfile
+    container_name: kavalx-txn-intelligence
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      memgraph:
+        condition: service_started
+
+  apk-analysis:
+    build:
+      context: ./services/apk_analysis
+      dockerfile: Dockerfile
+    container_name: kavalx-apk-analysis
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      milvus:
+        condition: service_healthy
+
+  graph-intelligence:
+    build:
+      context: ./services/graph_intelligence
+      dockerfile: Dockerfile
+    container_name: kavalx-graph-intelligence
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    env_file: .env
+    depends_on:
+      memgraph:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  biometrics:
+    build:
+      context: ./services/biometrics
+      dockerfile: Dockerfile
+    container_name: kavalx-biometrics
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  amadp:
+    build:
+      context: ./services/amadp
+      dockerfile: Dockerfile
+    container_name: kavalx-amadp
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  osint:
+    build:
+      context: ./services/osint
+      dockerfile: Dockerfile
+    container_name: kavalx-osint
+    restart: unless-stopped
+    ports:
+      - "8006:8006"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  compliance:
+    build:
+      context: ./services/compliance
+      dockerfile: Dockerfile
+    container_name: kavalx-compliance
+    restart: unless-stopped
+    ports:
+      - "8007:8007"
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  fl-coordinator:
+    build:
+      context: ./services/fl_coordinator
+      dockerfile: Dockerfile
+    container_name: kavalx-fl-coordinator
+    restart: unless-stopped
+    ports:
+      - "8008:8008"
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  # ── Frontend ─────────────────────────────────────────────
+
+  frontend:
+    image: node:20-alpine
+    container_name: kavalx-frontend
+    restart: unless-stopped
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - api-gateway
+
+# ── Named Volumes ──────────────────────────────────────────
+volumes:
+  pg_data:
+    driver: local
+  mg_data:
+    driver: local
+  redis_data:
+    driver: local
+  zk_data:
+    driver: local
+  zk_log:
+    driver: local
+  kafka_data:
+    driver: local
+  etcd_data:
+    driver: local
+  minio_data:
+    driver: local
+  milvus_data:
+    driver: local
+  frontend_node_modules:
+    driver: local

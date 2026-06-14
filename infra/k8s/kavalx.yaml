@@ -1,0 +1,407 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kavalx
+  labels:
+    app.kubernetes.io/part-of: kavalx
+    istio-injection: enabled
+---
+# ============================================
+# API Gateway Deployment
+# ============================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: kavalx
+  labels:
+    app: api-gateway
+    tier: ingress
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        tier: ingress
+    spec:
+      containers:
+      - name: gateway
+        image: kavalx/api-gateway:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: kavalx-secrets
+              key: jwt-secret
+        - name: REDIS_URL
+          value: "redis://redis-cluster:6379/0"
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: kavalx
+spec:
+  selector:
+    app: api-gateway
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+# ============================================
+# HPA — API Gateway
+# ============================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-gateway-hpa
+  namespace: kavalx
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-gateway
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "1000"
+---
+# ============================================
+# Graph Intelligence Deployment
+# ============================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graph-intelligence
+  namespace: kavalx
+  labels:
+    app: graph-intelligence
+    tier: ml
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: graph-intelligence
+  template:
+    metadata:
+      labels:
+        app: graph-intelligence
+        tier: ml
+    spec:
+      containers:
+      - name: graph-intelligence
+        image: kavalx/graph-intelligence:latest
+        ports:
+        - containerPort: 8003
+        env:
+        - name: MEMGRAPH_URL
+          value: "bolt://memgraph:7687"
+        - name: TORCHSERVE_URL
+          value: "http://torchserve:8080"
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8003
+          initialDelaySeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: graph-intelligence
+  namespace: kavalx
+spec:
+  selector:
+    app: graph-intelligence
+  ports:
+  - port: 8003
+    targetPort: 8003
+---
+# HPA — Graph Intelligence (target: 40ms p99 latency)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: graph-intelligence-hpa
+  namespace: kavalx
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: graph-intelligence
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: graph_query_latency_p99_ms
+      target:
+        type: AverageValue
+        averageValue: "40"
+---
+# ============================================
+# AMADP Orchestrator Deployment
+# ============================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amadp
+  namespace: kavalx
+  labels:
+    app: amadp
+    tier: ml
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: amadp
+  template:
+    metadata:
+      labels:
+        app: amadp
+        tier: ml
+    spec:
+      containers:
+      - name: amadp
+        image: kavalx/amadp:latest
+        ports:
+        - containerPort: 8005
+        env:
+        - name: VLLM_URL
+          value: "http://vllm:8090"
+        - name: REDIS_URL
+          value: "redis://redis-cluster:6379/0"
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "2Gi"
+          limits:
+            cpu: "4000m"
+            memory: "8Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amadp
+  namespace: kavalx
+spec:
+  selector:
+    app: amadp
+  ports:
+  - port: 8005
+    targetPort: 8005
+---
+# ============================================
+# PostgreSQL StatefulSet
+# ============================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: kavalx
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: kavalx
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: kavalx-secrets
+              key: pg-user
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: kavalx-secrets
+              key: pg-password
+        volumeMounts:
+        - name: pg-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+  volumeClaimTemplates:
+  - metadata:
+      name: pg-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3
+      resources:
+        requests:
+          storage: 100Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: kavalx
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  clusterIP: None
+---
+# ============================================
+# Memgraph StatefulSet
+# ============================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: memgraph
+  namespace: kavalx
+spec:
+  serviceName: memgraph
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memgraph
+  template:
+    metadata:
+      labels:
+        app: memgraph
+    spec:
+      containers:
+      - name: memgraph
+        image: memgraph/memgraph-platform:latest
+        ports:
+        - containerPort: 7687
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "4Gi"
+          limits:
+            cpu: "4000m"
+            memory: "16Gi"
+        volumeMounts:
+        - name: mg-data
+          mountPath: /var/lib/memgraph
+  volumeClaimTemplates:
+  - metadata:
+      name: mg-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3
+      resources:
+        requests:
+          storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memgraph
+  namespace: kavalx
+spec:
+  selector:
+    app: memgraph
+  ports:
+  - port: 7687
+    targetPort: 7687
+  clusterIP: None
+---
+# ============================================
+# NetworkPolicy — Restrict inter-service access
+# ============================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-internal-only
+  namespace: kavalx
+spec:
+  podSelector:
+    matchLabels:
+      tier: ml
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: api-gateway
+    ports:
+    - port: 8001
+    - port: 8002
+    - port: 8003
+    - port: 8004
+    - port: 8005
+    - port: 8006
+    - port: 8007
+    - port: 8008
+---
+# ============================================
+# Secrets (sealed-secrets template)
+# ============================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kavalx-secrets
+  namespace: kavalx
+type: Opaque
+data:
+  jwt-secret: Y2hhbmdlLW1lLWluLXByb2R1Y3Rpb24=
+  pg-user: a2F2YWx4
+  pg-password: a2F2YWx4X3NlY3VyZQ==
+  api-key-salt: c2FsdC1jaGFuZ2UtbWU=
