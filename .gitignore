@@ -104,7 +104,6 @@ docker-compose.override.yml
 *.safetensors
 *.bin
 checkpoints/
-models/
 runs/
 wandb/
 mlruns/
